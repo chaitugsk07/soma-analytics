@@ -1,0 +1,21 @@
+[package]
+name = "soma-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CLI for soma-analytics: apply models, run queries, inspect metadata."
+
+[[bin]]
+name = "soma-cli"
+path = "src/main.rs"
+
+[dependencies]
+soma-sdk      = { path = "../soma-sdk" }
+soma-semantic = { path = "../soma-semantic" }
+clap          = { version = "4", features = ["derive", "env"] }
+tokio         = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_yaml    = "0.9"
+serde_json    = "1"
+serde         = { version = "1", features = ["derive"] }
+anyhow        = "1"
+uuid          = { version = "1", features = ["v4", "serde"] }

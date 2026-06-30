@@ -1,0 +1,19 @@
+{
+  "name": "@soma-analytics/client",
+  "version": "0.1.0",
+  "description": "Zero-dependency browser fetch wrapper for the soma-analytics query API.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT",
+  "files": [
+    "index.js"
+  ],
+  "keywords": [
+    "soma-analytics",
+    "analytics",
+    "embed"
+  ]
+}
