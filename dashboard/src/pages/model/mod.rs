@@ -1,7 +1,11 @@
 //! Model view — "Power BI Model view"-style data-model browser.
 //!
-//! Fetches GET /api/v1/model (Editor+ token required) and renders one Card
-//! per cube showing its measures, dimensions, joins, and segments.
+//! Fetches GET /api/v1/model (Editor+ token required) and renders either:
+//!   • Diagram view (default) — SVG relationship diagram with cube boxes + join lines
+//!   • List view — one Card per cube showing measures, dimensions, joins, segments
+
+mod model_diagram;
+use model_diagram::ModelDiagramView;
 
 use crate::api::{fetch_model, FullCube, FullModel};
 use crate::app::AppCtx;
@@ -201,6 +205,41 @@ fn CubeCard(cube: FullCube) -> impl IntoView {
     }
 }
 
+// ── List view (existing card grid) ────────────────────────────────────────────
+
+#[component]
+fn ModelListView(cubes: Vec<FullCube>) -> impl IntoView {
+    if cubes.is_empty() {
+        return view! {
+            <Empty
+                title="No cubes yet".to_string()
+                description="Apply a model with `soma-cli apply` or the editor (coming soon).".to_string()
+            />
+        }
+        .into_any();
+    }
+
+    let cards = cubes
+        .into_iter()
+        .map(|cube| view! { <CubeCard cube=cube /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {cards}
+        </div>
+    }
+    .into_any()
+}
+
+// ── Toggle button helpers ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Diagram,
+    List,
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 #[component]
@@ -209,6 +248,7 @@ pub fn ModelViewPage() -> impl IntoView {
     let model: RwSignal<Option<FullModel>> = RwSignal::new(None);
     let err: RwSignal<Option<String>> = RwSignal::new(None);
     let loading = RwSignal::new(true);
+    let view_mode: RwSignal<ViewMode> = RwSignal::new(ViewMode::Diagram);
 
     Effect::new(move |_| {
         let token = ctx.token.get();
@@ -252,6 +292,36 @@ pub fn ModelViewPage() -> impl IntoView {
                 }
             }}
 
+            // ── View toggle ────────────────────────────────────────────────
+            <div class="flex items-center gap-1 p-1 rounded-lg bg-muted w-fit">
+                <button
+                    class=move || {
+                        let active = view_mode.get() == ViewMode::Diagram;
+                        if active {
+                            "px-3 py-1.5 text-sm font-medium rounded-md bg-background text-foreground shadow-sm transition-all"
+                        } else {
+                            "px-3 py-1.5 text-sm font-medium rounded-md text-muted-foreground hover:text-foreground transition-all"
+                        }
+                    }
+                    on:click=move |_| view_mode.set(ViewMode::Diagram)
+                >
+                    "Diagram"
+                </button>
+                <button
+                    class=move || {
+                        let active = view_mode.get() == ViewMode::List;
+                        if active {
+                            "px-3 py-1.5 text-sm font-medium rounded-md bg-background text-foreground shadow-sm transition-all"
+                        } else {
+                            "px-3 py-1.5 text-sm font-medium rounded-md text-muted-foreground hover:text-foreground transition-all"
+                        }
+                    }
+                    on:click=move |_| view_mode.set(ViewMode::List)
+                >
+                    "List"
+                </button>
+            </div>
+
             // ── Error banner ──────────────────────────────────────────────
             {move || err.get().map(|msg| view! {
                 <Alert variant=AlertVariant::Destructive>
@@ -267,28 +337,26 @@ pub fn ModelViewPage() -> impl IntoView {
                 </div>
             })}
 
-            // ── Model grid ────────────────────────────────────────────────
+            // ── Content: diagram or list ───────────────────────────────────
             {move || {
                 let Some(m) = model.get() else { return ().into_any(); };
 
-                if m.cubes.is_empty() {
-                    return view! {
-                        <Empty
-                            title="No cubes yet".to_string()
-                            description="Apply a model with `soma-cli apply` or the editor (coming soon).".to_string()
-                        />
-                    }.into_any();
+                match view_mode.get() {
+                    ViewMode::Diagram => {
+                        view! { <ModelDiagramView cubes=m.cubes /> }.into_any()
+                    }
+                    ViewMode::List => {
+                        if m.cubes.is_empty() {
+                            return view! {
+                                <Empty
+                                    title="No cubes yet".to_string()
+                                    description="Apply a model with `soma-cli apply` or the editor (coming soon).".to_string()
+                                />
+                            }.into_any();
+                        }
+                        view! { <ModelListView cubes=m.cubes /> }.into_any()
+                    }
                 }
-
-                let cards = m.cubes.into_iter().map(|cube| {
-                    view! { <CubeCard cube=cube /> }
-                }).collect::<Vec<_>>();
-
-                view! {
-                    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                        {cards}
-                    </div>
-                }.into_any()
             }}
         </div>
     }
