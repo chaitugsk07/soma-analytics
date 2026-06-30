@@ -104,12 +104,34 @@ async fn main() -> Result<()> {
         embed_secret: embed_secret.clone(),
     });
 
-    let state = AppState::new(
+    // AI seam (Phase 1.5): enabled when ANALYTICS_AI_ENABLED is "true", "1", "yes", or "on"
+    // (case-insensitive). Any other value (including "false", absent) disables it.
+    // Fix #5: tolerant parse — no startup error on "1"/"TRUE"/etc.
+    let ai_flag = soma_infra::config::env_or("ANALYTICS_AI_ENABLED", "false");
+    let ai_enabled = matches!(ai_flag.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
+
+    let ai_client_and_model = if ai_enabled {
+        let cfg = soma_infra::llm::LlmConfig::from_env()
+            .context("AI enabled but LLM client config is invalid (check ANTHROPIC_API_KEY + ANTHROPIC_MODEL)")?;
+        let model = cfg.model.clone();
+        let client = soma_infra::llm::LlmClient::new(cfg)
+            .context("failed to build LLM client")?;
+        tracing::info!("AI seam enabled (ANALYTICS_AI_ENABLED=true)");
+        Some((client, model))
+    } else {
+        tracing::info!("AI seam disabled (ANALYTICS_AI_ENABLED not set or false)");
+        None
+    };
+
+    let mut state = AppState::new(
         store.clone(),
         verifier as Arc<dyn soma_api::TokenVerifier>,
         audit_sink,
         embed_secret,
     );
+    if let Some((client, model)) = ai_client_and_model {
+        state = state.with_ai(client, model);
+    }
 
     // Bootstrap: if no active tokens exist for the default tenant, create a root admin
     // token and write it to a file. The plaintext is never logged.

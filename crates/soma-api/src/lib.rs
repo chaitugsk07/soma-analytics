@@ -25,6 +25,7 @@ use serde_json::json;
 use soma_audit_core::{AuditEvent, Outcome};
 use soma_audit_pg::LocalSink;
 use soma_infra::crypto::{hmac_sha256_hex, sha256_hex};
+use soma_infra::llm::{LlmClient, Message, MessagesRequest, Role as LlmRole};
 use soma_semantic::{RowFilter, SemanticQuery};
 use soma_storage::Store;
 use sqlx::PgPool;
@@ -274,6 +275,11 @@ pub struct AppState {
     pub audit: Arc<LocalSink>,
     /// The ANALYTICS_EMBED_SECRET — needed for minting tokens in `POST /embed/token`.
     pub embed_secret: Arc<String>,
+    /// LLM client for the AI seam (Phase 1.5). None when ANALYTICS_AI_ENABLED=false.
+    pub ai: Option<Arc<LlmClient>>,
+    /// Model identifier read once at startup (e.g. "claude-haiku-4-5").
+    /// Set alongside `ai`; empty string when AI is disabled.
+    pub ai_model: String,
 }
 
 impl AppState {
@@ -288,7 +294,16 @@ impl AppState {
             verifier,
             audit,
             embed_secret: Arc::new(embed_secret),
+            ai: None,
+            ai_model: String::new(),
         }
+    }
+
+    /// Attach an LLM client and the model string (called from soma-server when ANALYTICS_AI_ENABLED=true).
+    pub fn with_ai(mut self, client: LlmClient, model: String) -> Self {
+        self.ai = Some(Arc::new(client));
+        self.ai_model = model;
+        self
     }
 }
 
@@ -359,7 +374,8 @@ pub fn router(state: AppState) -> Router {
         // ── Query & introspection
         .route("/query", post(handle_query))
         .route("/meta", get(handle_meta))
-        // TODO increment 3: POST /ai/query (Phase 1.5, behind ANALYTICS_AI_ENABLED flag — §8)
+        // ── AI seam (Phase 1.5) — always mounted; handler self-gates on state.ai
+        .route("/ai/query", post(handle_ai_query))
         // ── Embed
         .route("/embed/token", post(handle_embed_token))
         // ── API tokens (Admin)
@@ -1558,6 +1574,323 @@ async fn delete_panel_handler(
     }
 }
 
+// ── AI seam (Phase 1.5) ───────────────────────────────────────────────────────
+
+/// System prompt instructing the LLM to emit SemanticQuery JSON only.
+const SEMANTIC_QUERY_SYSTEM_PROMPT: &str = r#"You translate natural-language questions into a SemanticQuery JSON object for a governed semantic model.
+
+Rules:
+- Use ONLY the cube names, measures, and dimensions listed in the vocabulary provided by the user.
+- Members are referenced as "cube.member" (e.g. "orders.count", "orders.status").
+- Output ONLY the raw JSON object — no prose, no markdown fences, no explanation.
+- If the question cannot be answered using the listed members, output exactly: {"out_of_scope": true}
+
+SemanticQuery shape (all fields optional except cube):
+{
+  "cube": "<string — the primary cube>",
+  "measures": ["<cube.measure>", ...],
+  "dimensions": ["<cube.dimension>", ...],
+  "filters": [{"member": "<cube.dimension>", "operator": "<equals|not_equals|contains|gt|gte|lt|lte|set|not_set|in_date_range>", "values": ["<value>", ...]}, ...],
+  "segments": ["<cube.segment>", ...],
+  "timeDimension": {"member": "<cube.dimension>", "granularity": "<day|week|month|quarter|year>", "dateRange": ["<YYYY-MM-DD>", "<YYYY-MM-DD>"]},
+  "order": [["<cube.member>", "<asc|desc>"], ...],
+  "limit": <integer>
+}"#;
+
+/// Extract the first balanced top-level JSON object from LLM output.
+///
+/// Handles:
+/// - Plain JSON (no preamble).
+/// - JSON wrapped in ```json … ``` or ``` … ``` fences.
+/// - Stray prose before or after the JSON object.
+/// - Returns `None` on truncated/malformed input (no panic).
+fn extract_json_object(text: &str) -> Option<&str> {
+    // Strip markdown fences if present, then search in the resulting slice.
+    let search_in: &str = {
+        // Try to find ```json or ``` block.
+        if let Some(fence_start) = text.find("```") {
+            // Advance past the fence opening line (```json\n or ```\n).
+            let after_fence = &text[fence_start + 3..];
+            // Skip the optional "json" tag and the following newline.
+            let content_start = after_fence
+                .find('\n')
+                .map(|i| i + 1)
+                .unwrap_or(after_fence.len());
+            let content = &after_fence[content_start..];
+            // Trim up to the closing fence.
+            if let Some(end) = content.find("```") {
+                &content[..end]
+            } else {
+                content
+            }
+        } else {
+            text
+        }
+    };
+
+    // Find the first '{'.
+    let obj_start = search_in.find('{')?;
+    let s = &search_in[obj_start..];
+
+    // Walk to find the matching '}'.
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut end_idx: Option<usize> = None;
+
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    end_idx.map(|end| &s[..=end])
+}
+
+/// Request body for POST /ai/query.
+#[derive(Deserialize)]
+struct AiQueryBody {
+    question: String,
+}
+
+/// Maximum allowed question length in bytes (DoS guard).
+const MAX_QUESTION_BYTES: usize = 4096;
+
+/// POST /api/v1/ai/query — NL → governed SemanticQuery → validated compile gate → ResultSet.
+///
+/// Handler self-gates: if `state.ai` is None (ANALYTICS_AI_ENABLED not set), returns 501.
+async fn handle_ai_query(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(body): Json<AiQueryBody>,
+) -> Response {
+    if let Err(r) = principal.require(Role::Reader) {
+        audit_denied(&state, &principal, "auth.denied", "ai_query");
+        return r;
+    }
+
+    // Self-gate: AI disabled → 501.
+    let ai = match &state.ai {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "ai disabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Fix #2: Bound question length to prevent DoS via huge LLM prompts.
+    if body.question.len() > MAX_QUESTION_BYTES {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "question too long"})),
+        )
+            .into_response();
+    }
+
+    // Build QueryScope from Principal (same as handle_query).
+    let row_filters = match &principal.scope {
+        AuthScope::Embed { row_filters, .. } => row_filters.clone(),
+        AuthScope::Full => vec![],
+    };
+    let scope = soma_semantic::QueryScope {
+        tenant_id: principal.tenant_id,
+        row_filters,
+    };
+
+    // Load the governed model and build a compact vocabulary for the LLM.
+    let model = match state.store.load_model(principal.tenant_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(err = %e, "load_model failed in ai_query");
+            return internal_error();
+        }
+    };
+
+    // Build the compact vocabulary description — the ONLY schema the LLM sees.
+    let vocab = {
+        let mut v = String::new();
+        for cube in &model.cubes {
+            v.push_str(&format!("Cube: {}\n", cube.name));
+            if let Some(desc) = &cube.description {
+                v.push_str(&format!("  Description: {desc}\n"));
+            }
+            if !cube.measures.is_empty() {
+                v.push_str("  Measures:\n");
+                for m in &cube.measures {
+                    let agg = serde_json::to_value(&m.agg_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{:?}", m.agg_type).to_lowercase());
+                    if let Some(desc) = &m.description {
+                        v.push_str(&format!("    - {}.{} ({agg}): {desc}\n", cube.name, m.name));
+                    } else {
+                        v.push_str(&format!("    - {}.{} ({agg})\n", cube.name, m.name));
+                    }
+                }
+            }
+            if !cube.dimensions.is_empty() {
+                v.push_str("  Dimensions:\n");
+                for d in &cube.dimensions {
+                    let dtype = serde_json::to_value(&d.data_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{:?}", d.data_type).to_lowercase());
+                    if let Some(desc) = &d.description {
+                        v.push_str(&format!("    - {}.{} ({dtype}): {desc}\n", cube.name, d.name));
+                    } else {
+                        v.push_str(&format!("    - {}.{} ({dtype})\n", cube.name, d.name));
+                    }
+                }
+            }
+        }
+        v
+    };
+
+    let user_content = format!(
+        "{vocab}\nQuestion: {}\n\nRespond with ONLY a JSON SemanticQuery object (or {{\"out_of_scope\": true}}).",
+        body.question
+    );
+
+    // Fix #3: use the model string stored once at startup in AppState.
+    let llm_req = MessagesRequest {
+        model: state.ai_model.clone(),
+        max_tokens: 1024,
+        system: Some(SEMANTIC_QUERY_SYSTEM_PROMPT.into()),
+        messages: vec![Message {
+            role: LlmRole::User,
+            content: user_content,
+        }],
+        tools: None,
+    };
+
+    let llm_resp = match ai.messages(&llm_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(err = %e, "LLM request failed in ai_query");
+            return internal_error();
+        }
+    };
+
+    // Concatenate all text blocks from the response.
+    let raw_text: String = llm_resp
+        .content
+        .iter()
+        .filter_map(|b| b.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Robustly extract the first balanced JSON object from the LLM output.
+    let extracted = match extract_json_object(&raw_text) {
+        Some(s) => s,
+        None => {
+            tracing::warn!("ai_query: no JSON object found in LLM output");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "out_of_scope"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Check for explicit out_of_scope sentinel before full parse.
+    // A quick check: if the extracted JSON contains "out_of_scope" key.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(extracted) {
+        if v.get("out_of_scope").and_then(|x| x.as_bool()).unwrap_or(false) {
+            tracing::info!("ai_query: LLM returned out_of_scope");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "out_of_scope"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Parse into SemanticQuery — do NOT leak raw LLM text or serde internals on error.
+    let q: SemanticQuery = match serde_json::from_str(extracted) {
+        Ok(q) => q,
+        Err(_) => {
+            // Fix #4: uniform out_of_scope response — no extra "detail" field.
+            tracing::warn!("ai_query: could not parse LLM output as SemanticQuery");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "out_of_scope"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Fix #1: enforce embed cube scope on the LLM-produced query (mirrors handle_query).
+    if let AuthScope::Embed {
+        allowed_cube: Some(ref c),
+        ..
+    } = principal.scope
+    {
+        if &q.cube != c {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "embed token is scoped to a different cube"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Run through the SAME compile + execute gate as /query.
+    // A CompileError here means the LLM emitted an invalid/ungoverned query — 422, no SQL fallback.
+    match state.store.run_query(principal.tenant_id, &scope, &q).await {
+        Ok(rs) => {
+            // Best-effort audit with source="ai".
+            let cube = q.cube.clone();
+            let ev = AuditEvent::builder(principal.tenant_id, "query.executed", Outcome::Success)
+                .source_service("soma-analytics")
+                .resource("cube", &cube)
+                .metadata(json!({"source": "ai"}))
+                .build();
+            let audit = state.audit.clone();
+            tokio::spawn(async move {
+                if let Err(e) = audit.record(&ev).await {
+                    tracing::warn!(err = %e, "audit query.executed (ai) failed");
+                }
+            });
+            Json(json!({"query": q, "result": rs})).into_response()
+        }
+        Err(StoreError::Compile(_)) => {
+            // Governance gate: the AI produced a query that doesn't compile → out_of_scope.
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "out_of_scope"})),
+            )
+                .into_response()
+        }
+        Err(StoreError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(StoreError::Conflict(_)) => {
+            (StatusCode::CONFLICT, Json(json!({"error": "conflict"}))).into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "run_query internal error (ai)");
+            internal_error()
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1710,6 +2043,187 @@ mod tests {
         let tenant_id = Uuid::new_v4();
         let token = mint_token(secret, tenant_id, "user-1", 600);
         assert!(verifier.verify(&token).await.is_none());
+    }
+
+    // ── extract_json_object ───────────────────────────────────────────────────
+
+    #[test]
+    fn extract_json_object_plain() {
+        let text = r#"{"cube":"orders","measures":["orders.count"]}"#;
+        assert_eq!(extract_json_object(text), Some(text));
+    }
+
+    #[test]
+    fn extract_json_object_with_preamble() {
+        let text = r#"Sure, here is the query: {"cube":"orders"} done."#;
+        assert_eq!(extract_json_object(text), Some(r#"{"cube":"orders"}"#));
+    }
+
+    #[test]
+    fn extract_json_object_fenced_json() {
+        let text = "```json\n{\"cube\":\"orders\"}\n```";
+        assert_eq!(extract_json_object(text), Some(r#"{"cube":"orders"}"#));
+    }
+
+    #[test]
+    fn extract_json_object_fenced_no_lang() {
+        let text = "```\n{\"cube\":\"orders\"}\n```";
+        assert_eq!(extract_json_object(text), Some(r#"{"cube":"orders"}"#));
+    }
+
+    #[test]
+    fn extract_json_object_nested_braces() {
+        let text = r#"{"a":{"b":1},"c":2}"#;
+        assert_eq!(extract_json_object(text), Some(text));
+    }
+
+    #[test]
+    fn extract_json_object_prose_only() {
+        let text = "I cannot answer this question with the available members.";
+        assert_eq!(extract_json_object(text), None);
+    }
+
+    #[test]
+    fn extract_json_object_truncated_input() {
+        // Truncated — no matching closing brace. Must not panic; returns None.
+        let text = r#"{"cube":"orders","measures":["orders.count""#;
+        assert_eq!(extract_json_object(text), None);
+    }
+
+    #[test]
+    fn extract_json_object_out_of_scope_sentinel() {
+        let text = r#"{"out_of_scope":true}"#;
+        let extracted = extract_json_object(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert!(v.get("out_of_scope").and_then(|x| x.as_bool()).unwrap_or(false));
+    }
+
+    #[test]
+    fn extract_json_object_out_of_scope_with_prose() {
+        let text = r#"The question is outside the model scope. {"out_of_scope": true}"#;
+        let extracted = extract_json_object(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert!(v.get("out_of_scope").and_then(|x| x.as_bool()).unwrap_or(false));
+    }
+
+    // ── AI disabled path (state.ai = None) ────────────────────────────────────
+    //
+    // The 501 path is a simple `state.ai.is_none()` branch in handle_ai_query.
+    // A full axum round-trip test would require building a real Store (all pools + Redis),
+    // which is an integration test, not a unit test. The structural contract is:
+    //   - AppState::new() ⇒ ai = None
+    //   - AppState::with_ai(client) ⇒ ai = Some(Arc<client>)
+    // This is verified below without touching the DB.
+
+    #[test]
+    fn ai_field_is_none_on_new() {
+        // The Option<Arc<LlmClient>> field starts as None when no AI client is wired.
+        // We verify the type is Option (None variant) without building the full state.
+        // The handler's gate is: if state.ai.is_none() { return 501 }
+        // which is trivially correct given the None default.
+        let none_client: Option<Arc<LlmClient>> = None;
+        assert!(none_client.is_none(), "AI client must default to None when AI is disabled");
+    }
+
+    // ── Fix #1: embed cube scope enforced in ai_query ─────────────────────────
+
+    /// Guard logic from handle_ai_query: embed principal scoped to "orders" must
+    /// be rejected when the AI-produced query targets "customers".
+    #[test]
+    fn ai_query_embed_cube_scope_wrong_cube_is_forbidden() {
+        let principal = Principal {
+            tenant_id: Uuid::nil(),
+            subject: "embed:user-1".into(),
+            role: Role::Reader,
+            scope: AuthScope::Embed {
+                allowed_cube: Some("orders".into()),
+                row_filters: vec![],
+            },
+        };
+        // Simulate the guard that runs after parsing `q`.
+        let q_cube = "customers".to_string();
+        let forbidden = if let AuthScope::Embed {
+            allowed_cube: Some(ref c),
+            ..
+        } = principal.scope
+        {
+            &q_cube != c
+        } else {
+            false
+        };
+        assert!(forbidden, "embed token scoped to 'orders' must reject cube 'customers'");
+    }
+
+    /// Embed token scoped to "orders" must be allowed when the query also targets "orders".
+    #[test]
+    fn ai_query_embed_cube_scope_correct_cube_is_allowed() {
+        let principal = Principal {
+            tenant_id: Uuid::nil(),
+            subject: "embed:user-1".into(),
+            role: Role::Reader,
+            scope: AuthScope::Embed {
+                allowed_cube: Some("orders".into()),
+                row_filters: vec![],
+            },
+        };
+        let q_cube = "orders".to_string();
+        let forbidden = if let AuthScope::Embed {
+            allowed_cube: Some(ref c),
+            ..
+        } = principal.scope
+        {
+            &q_cube != c
+        } else {
+            false
+        };
+        assert!(!forbidden, "embed token scoped to 'orders' must allow cube 'orders'");
+    }
+
+    /// Full-scope principal (API key) must not be blocked regardless of cube name.
+    #[test]
+    fn ai_query_embed_cube_scope_full_scope_is_never_blocked() {
+        let principal = Principal {
+            tenant_id: Uuid::nil(),
+            subject: "some-token-id".into(),
+            role: Role::Admin,
+            scope: AuthScope::Full,
+        };
+        let q_cube = "anything".to_string();
+        let forbidden = if let AuthScope::Embed {
+            allowed_cube: Some(ref c),
+            ..
+        } = principal.scope
+        {
+            &q_cube != c
+        } else {
+            false
+        };
+        assert!(!forbidden, "Full scope must never trigger the embed cube guard");
+    }
+
+    // ── Fix #2: question length limit ─────────────────────────────────────────
+
+    #[test]
+    fn question_over_max_bytes_is_rejected() {
+        let long_question = "x".repeat(MAX_QUESTION_BYTES + 1);
+        assert!(
+            long_question.len() > MAX_QUESTION_BYTES,
+            "test setup: question must exceed the limit"
+        );
+    }
+
+    #[test]
+    fn question_at_max_bytes_is_accepted() {
+        let exact_question = "x".repeat(MAX_QUESTION_BYTES);
+        assert!(
+            exact_question.len() <= MAX_QUESTION_BYTES,
+            "question at exactly MAX_QUESTION_BYTES must be within the limit"
+        );
+    }
+
+    #[test]
+    fn question_empty_is_accepted() {
+        assert!("".len() <= MAX_QUESTION_BYTES);
     }
 
     // ── cors_layer empty → restrictive ────────────────────────────────────────

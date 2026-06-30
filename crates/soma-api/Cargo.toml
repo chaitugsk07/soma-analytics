@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "soma-analytics axum router: auth middleware, Principal extractor, handlers, CORS, embed token."
 
 [dependencies]
-soma-infra     = { path = "../../../soma-infra", features = ["web", "crypto"] }
+soma-infra     = { path = "../../../soma-infra", features = ["web", "crypto", "llm"] }
 soma-storage   = { path = "../soma-storage" }
 soma-semantic  = { path = "../soma-semantic" }
 soma-audit-core = { path = "../../../soma-audit/crates/soma-audit-core" }
