@@ -159,7 +159,7 @@ async fn run_apply(client: &SomaClient, path: &str) -> Result<()> {
             base_sql: cube.base_sql.clone(),
             primary_key: cube.primary_key.clone(),
             cache_ttl_secs: cube.cache_ttl_secs,
-            tenant_column: None,
+            tenant_column: cube.tenant_column.clone(),
         };
         let created = client
             .create_cube(&body)

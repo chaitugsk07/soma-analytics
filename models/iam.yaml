@@ -1,0 +1,154 @@
+# soma-analytics semantic model for soma-iam reporting.
+#
+# Reports over IAM data living in the shared Postgres (schema `soma_iam`),
+# accessed read-only. Apply with:  soma-cli apply models/iam.yaml
+#
+# Tenant isolation is STRUCTURAL: the compiler always injects
+# `<tenant_column> = $tenant` (tenant taken from the caller's token), so every
+# query is automatically scoped to the caller's tenant. Every cube here uses
+# `tenant_id` (which is also the default), so no cube can leak across tenants.
+#
+# All measures are count / count_distinct (IAM is categorical, not numeric):
+# to get e.g. "active sessions", group by the relevant status dimension.
+
+data_sources:
+  - name: iam
+    driver: postgres   # NULL DSN -> resolves to the shared Postgres (ANALYTICS_DB_URL)
+
+cubes:
+  # ── Logins / sessions ───────────────────────────────────────────────
+  - name: sessions
+    data_source: iam
+    sql_table: soma_iam.fct_sessions
+    primary_key: session_id
+    tenant_column: tenant_id
+    title: "Sessions / logins"
+    description: "First-party login sessions; created_at is the login time."
+    dimensions:
+      - { name: is_active,      sql: is_active,      type: boolean, description: "Active vs revoked/expired" }
+      - { name: revoked_reason, sql: revoked_reason, type: string,  description: "logout / admin_revoke / membership_suspended / token_reuse" }
+      - { name: country,        sql: country_code,   type: string,  description: "ISO 3166-1 alpha-2 of the login" }
+      - { name: workspace_id,   sql: workspace_id,   type: string }
+      - { name: login_at,       sql: created_at,     type: time,    description: "Login timestamp" }
+      - { name: last_active_at, sql: last_active_at, type: time }
+    measures:
+      - { name: count,          type: count,                       description: "Total sessions / logins" }
+      - { name: distinct_users, type: count_distinct, sql: user_id, description: "Distinct users who logged in" }
+
+  # ── Members / roster ────────────────────────────────────────────────
+  - name: members
+    data_source: iam
+    sql_table: soma_iam.lnk_user_memberships
+    primary_key: membership_id
+    tenant_column: tenant_id
+    title: "Members"
+    description: "User-to-tenant memberships (the tenant's roster)."
+    dimensions:
+      - { name: status,       sql: status,       type: string, description: "active / invited / suspended" }
+      - { name: member_kind,  sql: member_kind,  type: string, description: "team vs end_user" }
+      - { name: workspace_id, sql: workspace_id, type: string }
+      - { name: joined_at,    sql: joined_at,    type: time }
+    measures:
+      - { name: count,          type: count,                       description: "Total memberships" }
+      - { name: distinct_users, type: count_distinct, sql: user_id, description: "Distinct users" }
+
+  # ── User account state (joined to memberships for tenant scope) ──────
+  - name: users
+    data_source: iam
+    base_sql: >
+      SELECT u.user_id, u.account_type, u.is_locked, u.email_verified,
+             u.is_deleted, u.last_login_at, u.created_at, m.tenant_id
+      FROM soma_iam.fct_users u
+      JOIN soma_iam.lnk_user_memberships m ON m.user_id = u.user_id
+    primary_key: user_id
+    tenant_column: tenant_id
+    title: "Users"
+    description: "User accounts (identity table) scoped to a tenant via membership. Use distinct_users to de-dupe multi-membership users."
+    dimensions:
+      - { name: account_type,   sql: account_type,   type: string,  description: "human vs service" }
+      - { name: is_locked,      sql: is_locked,      type: boolean, description: "Brute-force lockout" }
+      - { name: email_verified, sql: email_verified, type: boolean }
+      - { name: last_login_at,  sql: last_login_at,  type: time }
+      - { name: created_at,     sql: created_at,     type: time }
+    measures:
+      - { name: distinct_users, type: count_distinct, sql: user_id, description: "Distinct user accounts" }
+
+  # ── Auth identities (method / SSO adoption) ─────────────────────────
+  - name: identities
+    data_source: iam
+    sql_table: soma_iam.fct_identities
+    primary_key: identity_id
+    tenant_column: tenant_id
+    title: "Auth identities"
+    description: "Linked auth identities by provider (password / OIDC / social / passkey / ...)."
+    dimensions:
+      - { name: provider,   sql: provider,   type: string, description: "password/otp/magic_link/totp/passkey/social/oidc" }
+      - { name: is_deleted, sql: is_deleted, type: boolean }
+      - { name: created_at, sql: created_at, type: time }
+    measures:
+      - { name: count,          type: count }
+      - { name: distinct_users, type: count_distinct, sql: user_id }
+
+  # ── Roles ───────────────────────────────────────────────────────────
+  - name: roles
+    data_source: iam
+    sql_table: soma_iam.fct_roles
+    primary_key: role_id
+    tenant_column: tenant_id
+    title: "Roles"
+    dimensions:
+      - { name: scope_kind, sql: scope_kind, type: string, description: "tenant vs workspace" }
+      - { name: name,       sql: name,       type: string }
+      - { name: is_system,  sql: is_system,  type: boolean, description: "System (read-only) vs custom" }
+      - { name: is_deleted, sql: is_deleted, type: boolean }
+      - { name: created_at, sql: created_at, type: time }
+    measures:
+      - { name: count, type: count }
+
+  # ── Groups ──────────────────────────────────────────────────────────
+  - name: groups
+    data_source: iam
+    sql_table: soma_iam.fct_groups
+    primary_key: group_id
+    tenant_column: tenant_id
+    title: "Groups"
+    dimensions:
+      - { name: scope_kind, sql: scope_kind, type: string }
+      - { name: group_kind, sql: group_kind, type: string, description: "direct / resource_scoped / nested" }
+      - { name: is_deleted, sql: is_deleted, type: boolean }
+      - { name: created_at, sql: created_at, type: time }
+    measures:
+      - { name: count, type: count }
+
+  # ── Workspaces ──────────────────────────────────────────────────────
+  - name: workspaces
+    data_source: iam
+    sql_table: soma_iam.fct_workspaces
+    primary_key: workspace_id
+    tenant_column: tenant_id
+    title: "Workspaces"
+    dimensions:
+      - { name: status,     sql: status,     type: string, description: "active / suspended / deleted" }
+      - { name: is_deleted, sql: is_deleted, type: boolean }
+      - { name: created_at, sql: created_at, type: time }
+    measures:
+      - { name: count, type: count }
+
+  # ── Verification tokens (invite / OTP funnel) ───────────────────────
+  # Group by token_type='invite' for invite reporting. Non-invite tokens
+  # (OTP/magic_link) have NULL tenant_id and are auto-excluded by the
+  # structural tenant filter.
+  - name: verification_tokens
+    data_source: iam
+    sql_table: soma_iam.trx_verification_tokens
+    primary_key: token_id
+    tenant_column: tenant_id
+    title: "Verification tokens"
+    description: "Invites, OTPs, magic links, password resets."
+    dimensions:
+      - { name: token_type, sql: token_type, type: string, description: "email_otp / magic_link / password_reset / invite" }
+      - { name: is_used,    sql: is_used,    type: boolean, description: "Accepted/used vs pending" }
+      - { name: created_at, sql: created_at, type: time }
+      - { name: expires_at, sql: expires_at, type: time }
+    measures:
+      - { name: count, type: count }
