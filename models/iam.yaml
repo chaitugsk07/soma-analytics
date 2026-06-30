@@ -34,6 +34,9 @@ cubes:
     measures:
       - { name: count,          type: count,                       description: "Total sessions / logins" }
       - { name: distinct_users, type: count_distinct, sql: user_id, description: "Distinct users who logged in" }
+    joins:
+      - { name: user,      target_cube: users,      relationship: many_to_one, sql: "{CUBE}.user_id = {users}.user_id" }
+      - { name: workspace, target_cube: workspaces, relationship: many_to_one, sql: "{CUBE}.workspace_id = {workspaces}.workspace_id" }
 
   # ── Members / roster ────────────────────────────────────────────────
   - name: members
@@ -51,6 +54,9 @@ cubes:
     measures:
       - { name: count,          type: count,                       description: "Total memberships" }
       - { name: distinct_users, type: count_distinct, sql: user_id, description: "Distinct users" }
+    joins:
+      - { name: user,      target_cube: users,      relationship: many_to_one, sql: "{CUBE}.user_id = {users}.user_id" }
+      - { name: workspace, target_cube: workspaces, relationship: many_to_one, sql: "{CUBE}.workspace_id = {workspaces}.workspace_id" }
 
   # ── User account state (joined to memberships for tenant scope) ──────
   - name: users
