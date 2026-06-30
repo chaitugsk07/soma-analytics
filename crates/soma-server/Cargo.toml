@@ -10,7 +10,7 @@ name = "soma-analytics"
 path = "src/main.rs"
 
 [dependencies]
-soma-infra    = { path = "../../../soma-infra", features = ["db", "tracing", "signal", "config", "web", "crypto", "cache", "errors"] }
+soma-infra    = { path = "../../../soma-infra", features = ["db", "tracing", "signal", "config", "web", "crypto", "cache", "errors", "llm"] }
 soma-storage  = { path = "../soma-storage" }
 soma-api      = { path = "../soma-api" }
 soma-audit-pg = { path = "../../../soma-audit/crates/soma-audit-pg" }

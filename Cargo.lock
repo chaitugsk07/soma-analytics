@@ -2240,6 +2240,8 @@ dependencies = [
  "redis",
  "reqwest",
  "rust-embed",
+ "serde",
+ "serde_json",
  "sha2",
  "sqlx",
  "thiserror",
