@@ -1,0 +1,22 @@
+[package]
+name = "soma-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "soma-analytics server binary — boot sequence, pool wiring, graceful shutdown."
+
+[[bin]]
+name = "soma-analytics"
+path = "src/main.rs"
+
+[dependencies]
+soma-infra    = { path = "../../../soma-infra", features = ["db", "tracing", "signal", "config", "web", "crypto", "cache", "errors"] }
+soma-storage  = { path = "../soma-storage" }
+soma-api      = { path = "../soma-api" }
+soma-audit-pg = { path = "../../../soma-audit/crates/soma-audit-pg" }
+
+tokio  = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }

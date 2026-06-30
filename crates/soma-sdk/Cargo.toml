@@ -1,0 +1,18 @@
+[package]
+name = "soma-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust client for the soma-analytics API."
+
+[dependencies]
+soma-infra    = { path = "../../../soma-infra", features = ["http"] }
+soma-semantic = { path = "../soma-semantic" }
+reqwest       = { version = "0.12", features = ["json"], default-features = false }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+uuid          = { version = "1", features = ["v4", "serde"] }
+thiserror     = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

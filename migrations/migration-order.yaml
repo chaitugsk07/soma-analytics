@@ -1,0 +1,17 @@
+manifest_version: 1
+versions:
+  - version: 1
+    description: "Initial soma-analytics semantic model"
+    migrations:
+      - file: "20260629_01_enable-pgcrypto.sql"
+        created: "2026-06-29"
+        author: "soma-analytics"
+        why: "gen_random_uuid() + crypto primitives (db-standards DB-102)"
+      - file: "20260629_02_init-analytics-schema.sql"
+        created: "2026-06-29"
+        author: "soma-analytics"
+        why: "Model registry: api_tokens, data_sources, cubes, dimensions, measures, joins, segments"
+      - file: "20260629_03_init-dashboards.sql"
+        created: "2026-06-29"
+        author: "soma-analytics"
+        why: "Savable dashboards + panels (embedded reports layer)"

@@ -1,0 +1,28 @@
+[package]
+name = "soma-storage"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "soma-analytics metadata DB layer: model CRUD, query execution, result cache, migration runner."
+
+[dependencies]
+soma-infra = { path = "../../../soma-infra", features = ["db", "cache", "crypto", "errors"] }
+soma-schema = { path = "../../../soma-schema", default-features = false }
+soma-audit-core = { path = "../../../soma-audit/crates/soma-audit-core" }
+soma-audit-pg = { path = "../../../soma-audit/crates/soma-audit-pg" }
+soma-semantic = { path = "../soma-semantic" }
+
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "bigdecimal"] }
+bigdecimal = "0.4"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+redis = { version = "0.25", features = ["tokio-comp", "aio", "connection-manager"], default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
