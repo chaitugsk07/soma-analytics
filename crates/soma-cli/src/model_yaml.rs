@@ -45,6 +45,8 @@ pub struct CubeDef {
     pub title: Option<String>,
     pub description: Option<String>,
     pub cache_ttl_secs: Option<i32>,
+    /// Column used for structural tenant isolation (default: `"tenant_id"` server-side).
+    pub tenant_column: Option<String>,
     #[serde(default)]
     pub dimensions: Vec<DimensionDef>,
     #[serde(default)]
@@ -159,5 +161,37 @@ cubes:
         let model: ModelFile = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(model.cubes[0].dimensions.len(), 0);
         assert_eq!(model.cubes[0].measures.len(), 0);
+        assert!(model.cubes[0].tenant_column.is_none());
+    }
+
+    #[test]
+    fn parse_tenant_column() {
+        let yaml = r#"
+data_sources:
+  - name: db
+cubes:
+  - name: orders
+    data_source: db
+    sql_table: public.orders
+    primary_key: id
+    tenant_column: tenant_id
+"#;
+        let model: ModelFile = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(model.cubes[0].tenant_column.as_deref(), Some("tenant_id"));
+    }
+
+    #[test]
+    fn parse_iam_yaml() {
+        let yaml = include_str!("../../../models/iam.yaml");
+        let model: ModelFile = serde_yaml::from_str(yaml).expect("parse iam.yaml");
+        // All cubes in iam.yaml have an explicit tenant_column.
+        for cube in &model.cubes {
+            assert_eq!(
+                cube.tenant_column.as_deref(),
+                Some("tenant_id"),
+                "cube '{}' should have tenant_column = tenant_id",
+                cube.name
+            );
+        }
     }
 }
