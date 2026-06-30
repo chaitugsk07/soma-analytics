@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::cache_key::{build_cache_key, query_fingerprint};
 use crate::error::{Error, Result};
 use crate::pg::{crud, dashboard, model};
-use crate::types::{ColumnMeta, ResultMeta, ResultSet};
+use crate::types::{ColumnMeta, CompileResult, FullModel, ResultMeta, ResultSet};
 
 // Re-export row types so soma-api doesn't need to reach into pg:: sub-modules.
 pub use crate::pg::crud::{
@@ -80,6 +80,47 @@ impl Store {
     /// Load the tenant's full semantic model from the metadata tables.
     pub async fn load_model(&self, tenant_id: Uuid) -> Result<soma_semantic::Model> {
         model::load_model(&self.meta_pool, tenant_id).await
+    }
+
+    /// Export the full model for the builder/editor UI. Returns all fields
+    /// including `title`, `description`, `sql_table`, `base_sql`, and raw SQL
+    /// expressions on dimensions, measures, joins, and segments.
+    ///
+    /// Uses a direct DB read rather than going through `soma_semantic::Model`
+    /// so that fields the semantic model omits (title, description) are preserved.
+    pub async fn export_model(&self, tenant_id: Uuid) -> Result<FullModel> {
+        model::export_model(&self.meta_pool, tenant_id).await
+    }
+
+    /// Compile a semantic query and return the generated SQL with bind-parameter
+    /// placeholders (`$N`) — WITHOUT executing it. No cache interaction.
+    ///
+    /// Returns a `CompileResult` with `sql`, `columns`, and `param_count`.
+    /// On a compile error, returns `Err(Error::Compile(_))` so the handler can
+    /// surface a 422 with the compiler's message.
+    pub async fn compile_query(
+        &self,
+        tenant_id: Uuid,
+        scope: &QueryScope,
+        q: &SemanticQuery,
+    ) -> Result<CompileResult> {
+        let m = model::load_model(&self.meta_pool, tenant_id).await?;
+        let compiled = compile(&m, q, scope)?;
+        let param_count = compiled.binds.len();
+        let columns = compiled
+            .columns
+            .iter()
+            .map(|c| ColumnMeta {
+                name: c.name.clone(),
+                data_type: match c.data_type {
+                    soma_semantic::ColumnType::String => "string".into(),
+                    soma_semantic::ColumnType::Number => "number".into(),
+                    soma_semantic::ColumnType::Time => "time".into(),
+                    soma_semantic::ColumnType::Boolean => "boolean".into(),
+                },
+            })
+            .collect();
+        Ok(CompileResult { sql: compiled.sql, columns, param_count })
     }
 
     // ── Query execution + result cache ────────────────────────────────────────
@@ -245,6 +286,10 @@ impl Store {
     }
 
     // ── Data-source CRUD ──────────────────────────────────────────────────────
+
+    pub async fn list_data_sources(&self, tenant_id: Uuid) -> Result<Vec<DataSourceRow>> {
+        crud::list_data_sources(&self.meta_pool, tenant_id).await
+    }
 
     pub async fn create_data_source(
         &self,

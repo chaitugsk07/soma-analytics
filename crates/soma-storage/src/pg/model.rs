@@ -6,6 +6,7 @@ use uuid::Uuid;
 use soma_semantic::{AggType, Cube, DataType, Dimension, Join, Measure, Model, Relationship, Segment};
 
 use crate::error::{Error, Result};
+use crate::types::{FullCube, FullDimension, FullJoin, FullMeasure, FullModel, FullSegment};
 
 // ── Raw DB row types ──────────────────────────────────────────────────────────
 
@@ -22,8 +23,23 @@ struct CubeRow {
     model_version: i32,
 }
 
+/// Extended cube row that includes title and description (for `export_model`).
+#[derive(sqlx::FromRow)]
+struct FullCubeRow {
+    id: Uuid,
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    data_source_id: Uuid,
+    sql_table: Option<String>,
+    base_sql: Option<String>,
+    primary_key: String,
+    tenant_column: String,
+}
+
 #[derive(sqlx::FromRow)]
 struct DimRow {
+    id: Uuid,
     cube_id: Uuid,
     name: String,
     sql_expr: String,
@@ -33,6 +49,7 @@ struct DimRow {
 
 #[derive(sqlx::FromRow)]
 struct MeasureRow {
+    id: Uuid,
     cube_id: Uuid,
     name: String,
     sql_expr: Option<String>,
@@ -42,6 +59,7 @@ struct MeasureRow {
 
 #[derive(sqlx::FromRow)]
 struct JoinRow {
+    id: Uuid,
     cube_id: Uuid,
     target_cube_id: Uuid,
     name: String,
@@ -51,6 +69,7 @@ struct JoinRow {
 
 #[derive(sqlx::FromRow)]
 struct SegmentRow {
+    id: Uuid,
     cube_id: Uuid,
     name: String,
     sql_expr: String,
@@ -148,7 +167,7 @@ async fn load_model_internal(pool: &PgPool, tenant_id: Uuid) -> Result<(Model, V
 
     // Batch-fetch all child entities in one round-trip each.
     let dim_rows: Vec<DimRow> = sqlx::query_as(
-        r#"SELECT cube_id, name, sql_expr, data_type, description
+        r#"SELECT id, cube_id, name, sql_expr, data_type, description
            FROM "soma_analytics"."04_fct_dimensions"
            WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
            ORDER BY cube_id, name"#,
@@ -159,7 +178,7 @@ async fn load_model_internal(pool: &PgPool, tenant_id: Uuid) -> Result<(Model, V
     .await?;
 
     let measure_rows: Vec<MeasureRow> = sqlx::query_as(
-        r#"SELECT cube_id, name, sql_expr, agg_type, description
+        r#"SELECT id, cube_id, name, sql_expr, agg_type, description
            FROM "soma_analytics"."05_fct_measures"
            WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
            ORDER BY cube_id, name"#,
@@ -170,7 +189,7 @@ async fn load_model_internal(pool: &PgPool, tenant_id: Uuid) -> Result<(Model, V
     .await?;
 
     let join_rows: Vec<JoinRow> = sqlx::query_as(
-        r#"SELECT cube_id, target_cube_id, name, relationship, sql_on
+        r#"SELECT id, cube_id, target_cube_id, name, relationship, sql_on
            FROM "soma_analytics"."06_fct_joins"
            WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
            ORDER BY cube_id, name"#,
@@ -181,7 +200,7 @@ async fn load_model_internal(pool: &PgPool, tenant_id: Uuid) -> Result<(Model, V
     .await?;
 
     let segment_rows: Vec<SegmentRow> = sqlx::query_as(
-        r#"SELECT cube_id, name, sql_expr
+        r#"SELECT id, cube_id, name, sql_expr
            FROM "soma_analytics"."07_fct_segments"
            WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
            ORDER BY cube_id, name"#,
@@ -262,6 +281,154 @@ async fn load_model_internal(pool: &PgPool, tenant_id: Uuid) -> Result<(Model, V
         Error::Compile(soma_semantic::CompileError::UnknownCube(format!("model validation: {e:?}")))
     })?;
     Ok((model, cube_rows))
+}
+
+// ── Full model export (for GET /api/v1/model) ─────────────────────────────────
+
+/// Export the full tenant model as a `FullModel` DTO, including title, description,
+/// sql_table, base_sql, and all SQL expressions on child entities.
+///
+/// Reads directly from the metadata tables (does NOT go through `soma_semantic::Model`)
+/// so that fields the semantic model omits (title, description) are preserved.
+pub async fn export_model(pool: &PgPool, tenant_id: Uuid) -> Result<FullModel> {
+    let cube_rows: Vec<FullCubeRow> = sqlx::query_as(
+        r#"SELECT id, name, title, description, data_source_id,
+                  sql_table, base_sql, primary_key, tenant_column
+           FROM "soma_analytics"."03_fct_cubes"
+           WHERE tenant_id = $1 AND is_deleted = false
+           ORDER BY name"#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+
+    if cube_rows.is_empty() {
+        return Ok(FullModel { cubes: vec![] });
+    }
+
+    let cube_ids: Vec<Uuid> = cube_rows.iter().map(|r| r.id).collect();
+
+    // Batch-fetch all child entities.
+    let dim_rows: Vec<DimRow> = sqlx::query_as(
+        r#"SELECT id, cube_id, name, sql_expr, data_type, description
+           FROM "soma_analytics"."04_fct_dimensions"
+           WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
+           ORDER BY cube_id, name"#,
+    )
+    .bind(tenant_id)
+    .bind(&cube_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let measure_rows: Vec<MeasureRow> = sqlx::query_as(
+        r#"SELECT id, cube_id, name, sql_expr, agg_type, description
+           FROM "soma_analytics"."05_fct_measures"
+           WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
+           ORDER BY cube_id, name"#,
+    )
+    .bind(tenant_id)
+    .bind(&cube_ids)
+    .fetch_all(pool)
+    .await?;
+
+    // Join rows need the target cube name — resolve via a name lookup.
+    let join_rows: Vec<JoinRow> = sqlx::query_as(
+        r#"SELECT id, cube_id, target_cube_id, name, relationship, sql_on
+           FROM "soma_analytics"."06_fct_joins"
+           WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
+           ORDER BY cube_id, name"#,
+    )
+    .bind(tenant_id)
+    .bind(&cube_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let segment_rows: Vec<SegmentRow> = sqlx::query_as(
+        r#"SELECT id, cube_id, name, sql_expr
+           FROM "soma_analytics"."07_fct_segments"
+           WHERE tenant_id = $1 AND cube_id = ANY($2) AND is_deleted = false
+           ORDER BY cube_id, name"#,
+    )
+    .bind(tenant_id)
+    .bind(&cube_ids)
+    .fetch_all(pool)
+    .await?;
+
+    // Build a cube_id → name map for resolving join target names.
+    let id_to_name: std::collections::HashMap<Uuid, &str> =
+        cube_rows.iter().map(|r| (r.id, r.name.as_str())).collect();
+
+    let cubes = cube_rows
+        .iter()
+        .map(|cr| {
+            let dimensions = dim_rows
+                .iter()
+                .filter(|d| d.cube_id == cr.id)
+                .map(|d| FullDimension {
+                    id: d.id.to_string(),
+                    name: d.name.clone(),
+                    sql: d.sql_expr.clone(),
+                    data_type: d.data_type.clone(),
+                    description: d.description.clone(),
+                })
+                .collect();
+
+            let measures = measure_rows
+                .iter()
+                .filter(|m| m.cube_id == cr.id)
+                .map(|m| FullMeasure {
+                    id: m.id.to_string(),
+                    name: m.name.clone(),
+                    agg_type: m.agg_type.clone(),
+                    sql: m.sql_expr.clone(),
+                    description: m.description.clone(),
+                })
+                .collect();
+
+            let joins = join_rows
+                .iter()
+                .filter(|j| j.cube_id == cr.id)
+                .map(|j| FullJoin {
+                    id: j.id.to_string(),
+                    name: j.name.clone(),
+                    target_cube: id_to_name
+                        .get(&j.target_cube_id)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| j.target_cube_id.to_string()),
+                    relationship: j.relationship.clone(),
+                    sql: j.sql_on.clone(),
+                })
+                .collect();
+
+            let segments = segment_rows
+                .iter()
+                .filter(|s| s.cube_id == cr.id)
+                .map(|s| FullSegment {
+                    id: s.id.to_string(),
+                    name: s.name.clone(),
+                    sql: s.sql_expr.clone(),
+                })
+                .collect();
+
+            FullCube {
+                id: cr.id.to_string(),
+                name: cr.name.clone(),
+                title: cr.title.clone(),
+                description: cr.description.clone(),
+                data_source: cr.data_source_id.to_string(),
+                sql_table: cr.sql_table.clone(),
+                base_sql: cr.base_sql.clone(),
+                primary_key: cr.primary_key.clone(),
+                tenant_column: cr.tenant_column.clone(),
+                dimensions,
+                measures,
+                joins,
+                segments,
+            }
+        })
+        .collect();
+
+    Ok(FullModel { cubes })
 }
 
 // ── Converters ────────────────────────────────────────────────────────────────

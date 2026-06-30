@@ -374,6 +374,9 @@ pub fn router(state: AppState) -> Router {
         // ── Query & introspection
         .route("/query", post(handle_query))
         .route("/meta", get(handle_meta))
+        // ── Builder endpoints
+        .route("/model", get(handle_model))
+        .route("/query/compile", post(handle_compile_query))
         // ── AI seam (Phase 1.5) — always mounted; handler self-gates on state.ai
         .route("/ai/query", post(handle_ai_query))
         // ── Embed
@@ -646,6 +649,91 @@ async fn handle_meta(State(state): State<AppState>, principal: Principal) -> Res
     Json(json!({"cubes": cubes})).into_response()
 }
 
+// ── GET /api/v1/model (Editor+) ──────────────────────────────────────────────
+
+/// Return the full model for the caller's tenant — every cube with title, description,
+/// data_source, sql_table, base_sql, primary_key, tenant_column, and all nested
+/// dimensions (sql), measures (sql/agg_type), joins (sql/relationship), and segments (sql).
+///
+/// Editor+ only: this endpoint exposes raw SQL expressions that /meta hides.
+async fn handle_model(State(state): State<AppState>, principal: Principal) -> Response {
+    if let Err(r) = principal.require(Role::Editor) {
+        audit_denied(&state, &principal, "auth.denied", "model");
+        return r;
+    }
+
+    match state.store.export_model(principal.tenant_id).await {
+        Ok(full_model) => Json(full_model).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "export_model failed");
+            internal_error()
+        }
+    }
+}
+
+// ── POST /api/v1/query/compile (Reader+) ─────────────────────────────────────
+
+/// Dry-run compile a SemanticQuery: returns the generated SQL (with $N placeholders),
+/// output column metadata, and the bind-parameter count. Does NOT execute the query.
+///
+/// Reader+: same role floor as /query; embed cube scope is enforced.
+/// On a compile error → 422 with {"error": "compile_error", "detail": "<message>"}.
+async fn handle_compile_query(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(body): Json<SemanticQuery>,
+) -> Response {
+    if let Err(r) = principal.require(Role::Reader) {
+        audit_denied(&state, &principal, "auth.denied", "query_compile");
+        return r;
+    }
+
+    // Enforce embed cube scope (mirrors handle_query).
+    if let AuthScope::Embed {
+        allowed_cube: Some(ref c),
+        ..
+    } = principal.scope
+    {
+        if &body.cube != c {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "embed token is scoped to a different cube"})),
+            )
+                .into_response();
+        }
+    }
+
+    let row_filters = match &principal.scope {
+        AuthScope::Embed { row_filters, .. } => row_filters.clone(),
+        AuthScope::Full => vec![],
+    };
+
+    let scope = soma_semantic::QueryScope {
+        tenant_id: principal.tenant_id,
+        row_filters,
+    };
+
+    match state.store.compile_query(principal.tenant_id, &scope, &body).await {
+        Ok(result) => Json(result).into_response(),
+        Err(StoreError::Compile(ref ce)) => {
+            tracing::warn!(err = %ce, "query/compile: compile error");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "compile_error", "detail": ce.to_string()})),
+            )
+                .into_response()
+        }
+        Err(StoreError::NotFound(_)) => {
+            tracing::warn!("query/compile: not found");
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "query/compile: internal error");
+            internal_error()
+        }
+    }
+}
+
 // ── POST /api/v1/embed/token (Editor+) ───────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -796,9 +884,17 @@ async fn list_datasources(State(state): State<AppState>, principal: Principal) -
         audit_denied(&state, &principal, "auth.denied", "datasources");
         return r;
     }
-    // Phase-1: return empty list (data sources managed via env/migration).
-    // Full CRUD wired via store.list_data_sources when needed.
-    Json(json!([])).into_response()
+    match state.store.list_data_sources(principal.tenant_id).await {
+        Ok(rows) => Json(json!(rows.iter().map(|r| json!({
+            "id": r.id,
+            "name": r.name,
+            "driver": r.driver,
+        })).collect::<Vec<_>>())).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "list_datasources failed");
+            internal_error()
+        }
+    }
 }
 
 #[derive(Deserialize)]

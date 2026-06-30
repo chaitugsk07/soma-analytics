@@ -16,6 +16,18 @@
 
 use std::sync::Arc;
 
+// ── Embedded dashboard (feature = "dashboard") ────────────────────────────────
+//
+// Embeds dashboard/dist at compile time via RustEmbed. The feature is OFF by
+// default so `cargo build` works without dashboard/dist existing.
+// To produce a single-binary build:
+//   1. cd dashboard && trunk build --release
+//   2. cargo build -p soma-server --release --features dashboard
+#[cfg(feature = "dashboard")]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../dashboard/dist"]
+struct Dashboard;
+
 use anyhow::{Context, Result};
 use soma_api::{AppState, LocalTokenVerifier};
 use soma_audit_pg::{AuditKeys, LocalSink};
@@ -158,9 +170,18 @@ async fn main() -> Result<()> {
     }
 
     // 9. Router + CORS + TraceLayer
+    #[cfg(feature = "dashboard")]
+    let app = {
+        soma_api::router(state)
+            .fallback(|uri: axum::http::Uri| async move {
+                soma_infra::web::serve_spa::<Dashboard>(&uri)
+            })
+            .layer(soma_api::cors_layer(&cors_origins))
+            .layer(TraceLayer::new_for_http())
+    };
+    #[cfg(not(feature = "dashboard"))]
     let app = soma_api::router(state)
         .layer(soma_api::cors_layer(&cors_origins))
-        // increment 3: serve_spa::<Dashboard> fallback (dashboard crate not yet built)
         .layer(TraceLayer::new_for_http());
 
     // 10. Serve with graceful shutdown

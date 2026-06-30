@@ -9,14 +9,24 @@ description = "soma-analytics server binary — boot sequence, pool wiring, grac
 name = "soma-analytics"
 path = "src/main.rs"
 
+[features]
+# Embed the pre-built dashboard/dist into the binary at compile time.
+# OFF by default — `cargo build` works without dashboard/dist existing.
+# To enable: `cargo build -p soma-server --features dashboard`
+# (build the dashboard first: `cd dashboard && trunk build --release`)
+dashboard = ["dep:rust-embed", "dep:axum"]
+
 [dependencies]
 soma-infra    = { path = "../../../soma-infra", features = ["db", "tracing", "signal", "config", "web", "crypto", "cache", "errors", "llm"] }
 soma-storage  = { path = "../soma-storage" }
 soma-api      = { path = "../soma-api" }
 soma-audit-pg = { path = "../../../soma-audit/crates/soma-audit-pg" }
 
-tokio  = { version = "1", features = ["rt-multi-thread", "macros"] }
-anyhow = "1"
+tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow     = "1"
 tower-http = { version = "0.6", features = ["trace"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+tracing    = "0.1"
+uuid       = { version = "1", features = ["v4"] }
+
+rust-embed = { version = "8", optional = true }
+axum       = { version = "0.8", optional = true }
