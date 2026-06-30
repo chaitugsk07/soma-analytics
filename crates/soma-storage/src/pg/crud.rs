@@ -119,6 +119,23 @@ pub async fn create_data_source(
     Ok(row)
 }
 
+pub async fn list_data_sources(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<Vec<DataSourceRow>> {
+    let rows: Vec<DataSourceRow> = sqlx::query_as(
+        r#"SELECT id, tenant_id, name, driver, dsn_ciphertext, is_deleted, created_at, updated_at
+           FROM "soma_analytics"."02_fct_data_sources"
+           WHERE tenant_id = $1 AND is_deleted = false
+           ORDER BY name"#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Db)?;
+    Ok(rows)
+}
+
 pub async fn soft_delete_data_source(
     pool: &PgPool,
     sink: &Arc<LocalSink>,

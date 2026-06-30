@@ -16,7 +16,10 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use store::Store;
-pub use types::{ColumnMeta, ResultMeta, ResultSet};
+pub use types::{
+    ColumnMeta, CompileResult, FullCube, FullDimension, FullJoin, FullMeasure, FullModel,
+    FullSegment, ResultMeta, ResultSet,
+};
 
 use soma_schema::{Migrator, PostgresConfig, PostgresDriver};
 use sqlx::PgPool;
